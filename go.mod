@@ -1,4 +1,4 @@
-module Name5
+module github.com/yunginnanet/Name5
 
 go 1.17
 
