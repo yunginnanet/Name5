@@ -1,11 +1,13 @@
-package Name5
+package name5
 
 import (
+	"errors"
 	"time"
 
 	"github.com/miekg/dns"
+	cmap "github.com/orcaman/concurrent-map"
 	"github.com/rs/zerolog/log"
-	"github.com/yunginnanet/Rate5"
+	"inet.af/netaddr"
 )
 
 // TODO: benchmarks
@@ -18,8 +20,6 @@ type resolveSlower struct {
 func (rs *resolveSlower) UniqueKey() string {
 	return rs.key
 }
-
-var dnsRater *rate5.Limiter
 
 /*
 SmuggleError crafts a custom DNS answer to include our error message.
@@ -44,10 +44,10 @@ func query(domain string, qtype uint16) *dns.Msg {
 	m1.Question = make([]dns.Question, 1)
 	m1.Question[0] = dns.Question{Name: domain, Qtype: qtype, Qclass: dns.ClassINET}
 	lookup := &dns.Client{
-		Timeout:        time.Duration(6) * time.Second,
+		Timeout:        time.Duration(dnsTimeout) * time.Second,
 		SingleInflight: true,
 	}
-	in, _, err := lookup.Exchange(m1, "127.0.0.1:53")
+	in, _, err := lookup.Exchange(m1, dnsResolver)
 	if err != nil {
 		log.Error().Err(err).Msg("query")
 		resp := SmuggleError(err)
@@ -70,7 +70,20 @@ func Query6(domain string) *dns.Msg {
 	return query(domain, 28)
 }
 
+var arpaToIP = cmap.New()
+
+var ErrInvalidIP = errors.New("invalid IP")
+
 // QueryPTR retrievs reverse DNS records
 func QueryPTR(ip string) *dns.Msg {
-	return query(ip, 12)
+	if _, err := netaddr.ParseIP(ip); err != nil {
+		return SmuggleError(ErrInvalidIP)
+	}
+	arpa, err := dns.ReverseAddr(ip)
+	arpa = dns.Fqdn(arpa)
+	if err != nil {
+		return SmuggleError(err)
+	}
+	arpaToIP.Set(arpa, ip)
+	return query(arpa, 12)
 }

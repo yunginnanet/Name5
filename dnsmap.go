@@ -1,10 +1,13 @@
-package Name5
+package name5
 
 import (
-	"sync"
+	"context"
+	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/orcaman/concurrent-map"
 	"github.com/rs/zerolog/log"
 )
 
@@ -15,199 +18,143 @@ type ipname struct {
 
 // DNSMap is used for resolving and keeping track of DNS query results and their relationships
 type DNSMap struct {
-	IPToPTR      map[string]string
-	NameToIP     map[string]*ipname
-	Waitlist4    map[string]int
-	Waitlist6    map[string]int
-	CNAMETargets map[string]int
+	IPToPTR      cmap.ConcurrentMap
+	NameToIPs    cmap.ConcurrentMap // map[string]*ipname
+	Working      *int64
+	CNAMETargets *int64
 
-	born time.Time
-	mu   *sync.RWMutex
+	born *time.Time
+	ctx  context.Context
+}
+
+func newPtr(i int64) *int64 {
+	return &i
+}
+
+func (dnm *DNSMap) initCounters() {
+	dnm.Working = newPtr(0)
+	dnm.CNAMETargets = newPtr(0)
+}
+
+func (dnm *DNSMap) initMaps() {
+	dnm.IPToPTR = cmap.New()
+	dnm.NameToIPs = cmap.New() // make(map[string]*ipname)
 }
 
 // NewDNSMap creates a new DNSMap type
 func NewDNSMap(name string) *DNSMap {
+	tn := time.Now()
 	name = dns.Fqdn(name)
 	dnsmap := &DNSMap{ //   ipaddr[domain][ipaddr]boolean
-		IPToPTR:      make(map[string]string),
-		NameToIP:     make(map[string]*ipname),
-		Waitlist4:    make(map[string]int),
-		Waitlist6:    make(map[string]int),
-		CNAMETargets: make(map[string]int),
-
-		born: time.Now(),
-		mu:   &sync.RWMutex{},
+		born: &tn,
 	}
 
-	dnsmap.addToWaitlist(dns.Fqdn(name))
+	dnsmap.initMaps()
+	dnsmap.initCounters()
+
+	ipa := net.ParseIP(name)
+	if _, ok := dns.IsDomainName(name); !ok && ipa != nil {
+		var err error
+		name, err = dns.ReverseAddr(name)
+		if err != nil {
+			return &DNSMap{}
+		}
+	}
+
+	atomic.AddInt64(dnsmap.Working, 2)
 	go dnsmap.process(Query4(name))
 	go dnsmap.process(Query6(name))
 	dnsmap.waitUntilDone()
 	return dnsmap
 }
 
-func (d *DNSMap) waitUntilDone() {
+func (dnm *DNSMap) waitUntilDone() {
+	time.Sleep(1 * time.Second)
 	for {
-		d.mu.RLock()
-		if time.Since(d.born) > 5*time.Minute {
-			d.mu.RUnlock()
-			log.Error().Msg("DNSMap timed out after 5 minutes")
+		select {
+		case <-dnm.ctx.Done():
 			return
+		default:
+			time.Sleep(5 * time.Second)
+			if atomic.LoadInt64(dnm.Working) == 0 &&
+				atomic.LoadInt64(dnm.CNAMETargets) == 0 {
+				return
+			}
 		}
-		if len(d.Waitlist4) == 0 && len(d.Waitlist6) == 0 {
-			d.mu.RUnlock()
-			return
-		}
-		d.mu.RUnlock()
-		time.Sleep(20 * time.Millisecond)
 	}
 }
 
-func (d *DNSMap) addToWaitlist(name string) {
-	name = dns.Fqdn(name)
-	d.mu.Lock()
-	if _, ok := d.Waitlist4[name]; !ok {
-		d.Waitlist4[name] = 1
-	}
-	if _, ok := d.Waitlist6[name]; !ok {
-		d.Waitlist6[name] = 1
-	}
-	d.mu.Unlock()
+func (dnm *DNSMap) isPTRResolved(object string) bool {
+	return dnm.IPToPTR.Has(object)
 }
 
-func (d *DNSMap) isInWaitlist(name string) bool {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	name = dns.Fqdn(name)
-	_, ok4 := d.Waitlist4[name]
-	_, ok6 := d.Waitlist6[name]
-	if !ok4 && !ok6 {
-		return false
-	}
-	return true
+func (dnm *DNSMap) chipOff(delay int) {
+	go func() {
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+		atomic.AddInt64(dnm.Working, -1)
+	}()
 }
 
-func (d *DNSMap) isPTRResolved(object string) bool {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if _, ok := d.IPToPTR[object]; ok {
-		return true
-	}
-	return false
-}
-
-func (d *DNSMap) process(in *dns.Msg) {
-	var (
-		addrs    []string
-		question string
-		ptr      = ""
-		cname    = ""
-		qtype    uint16
-	)
-	question = in.Question[0].Name
-	qtype = in.Question[0].Qtype
-
+func (dnm *DNSMap) process(in *dns.Msg) {
+	question := in.Question[0].Name
+	var addrs []string
 	for _, resource := range in.Answer {
+
+		log.Trace().Int64("working", atomic.LoadInt64(dnm.Working)).
+			Interface("resource", resource).Msg("working...")
+
 		switch record := resource.(type) {
 		case *dns.NULL:
 			log.Error().Caller().Msg(record.Data)
+			dnm.chipOff(500)
 			continue
 		case *dns.A:
-			addrs = append(addrs, record.A.String())
-			ptrReq, _ := dns.ReverseAddr(record.A.String())
-			d.addToWaitlist(ptrReq)
-			d.process(QueryPTR(ptrReq))
+			a := record.A.String()
+			addrs = append(addrs, a)
+			atomic.AddInt64(dnm.Working, 1)
+			go dnm.process(QueryPTR(a))
+			dnm.chipOff(100)
 		case *dns.AAAA:
-			addrs = append(addrs, record.AAAA.String())
-			ptrReq, _ := dns.ReverseAddr(record.AAAA.String())
-			d.addToWaitlist(ptrReq)
-			d.process(QueryPTR(ptrReq))
+			aaaa := record.AAAA.String()
+			addrs = append(addrs, aaaa)
+			atomic.AddInt64(dnm.Working, 1)
+			go dnm.process(QueryPTR(aaaa))
+			dnm.chipOff(100)
 		case *dns.PTR:
-			ptr = record.Ptr
-			d.mu.RLock()
-			if _, ok := d.NameToIP[ptr]; !ok {
-				d.mu.RUnlock()
-				if !d.isInWaitlist(ptr) {
-					d.addToWaitlist(ptr)
-					go d.process(Query4(ptr))
-					go d.process(Query6(ptr))
-				}
-			} else {
-				d.mu.RUnlock()
+			ptr := record.Ptr
+			ogIP, ok := arpaToIP.Get(in.Question[0].Name)
+			if !ok {
+				log.Warn().Caller().Interface("in", in).
+					Msg("no IP for rev ARPA name from question...")
 			}
+			dnm.IPToPTR.Set(ogIP.(string), ptr)
+			if !dnm.NameToIPs.Has(ptr) {
+				atomic.AddInt64(dnm.Working, 2)
+				go dnm.process(Query4(ptr))
+				go dnm.process(Query6(ptr))
+			}
+			dnm.chipOff(100)
 		case *dns.CNAME:
-			cname = record.Target
-			d.mu.Lock()
-			d.CNAMETargets[cname] = 1
-			d.mu.Unlock()
-			d.mu.RLock()
-			if _, ok := d.NameToIP[cname]; !ok {
-				d.mu.RUnlock()
-				if !d.isInWaitlist(cname) {
-					d.addToWaitlist(cname)
-					go d.process(Query4(cname))
-					go d.process(Query6(cname))
-				}
-			} else {
-				d.mu.RUnlock()
+			cname := record.Target
+			if !dnm.NameToIPs.Has(cname) {
+				atomic.AddInt64(dnm.Working, 2)
+				go dnm.process(Query4(cname))
+				go dnm.process(Query6(cname))
 			}
+			dnm.chipOff(100)
 		default:
 			log.Warn().Caller().Interface("resource", record).Msg("unhandled record")
 		}
 	}
-
-	if cname == "" && ptr == "" && len(addrs) == 0 {
-		d.removeWait(question, qtype)
-	}
-
-	if ptr != "" {
-		d.mu.Lock()
-		if _, ok := d.IPToPTR[question]; !ok {
-			d.IPToPTR[question] = ptr
-		}
-		d.mu.Unlock()
-	}
-
-	if len(addrs) > 0 {
-		d.mu.Lock()
-		var resolved *ipname
-		var ok bool
-		if resolved, ok = d.NameToIP[question]; ok {
-			resolved.IPs = append(resolved.IPs, addrs...)
-		} else {
-			d.NameToIP[question] = &ipname{Name: question, IPs: addrs}
-		}
-		d.mu.Unlock()
-	}
-
-	if ptr != "" {
-		d.mu.Lock()
-		d.IPToPTR[question] = ptr
-		d.mu.Unlock()
-	}
-
-	d.removeWait(question, qtype)
-}
-
-func (d *DNSMap) removeWait(question string, qtype uint16) {
-	if !d.isInWaitlist(question) {
+	if len(addrs) < 0 {
 		return
 	}
-	d.mu.Lock()
-	switch qtype {
-	case dns.TypeA:
-		delete(d.Waitlist4, question)
-	case dns.TypeAAAA:
-		delete(d.Waitlist6, question)
-	case dns.TypeCNAME:
-	case dns.TypePTR:
-		delete(d.Waitlist4, question)
-		delete(d.Waitlist6, question)
-	default:
-		log.Warn().Caller().Str("question", question).
-			Uint16("qtype", qtype).
-			Msg("unhandled blank response")
+	current, ok := dnm.NameToIPs.Get(question)
+	if !ok {
+		dnm.NameToIPs.Set(question, &ipname{Name: question, IPs: addrs})
+		return
 	}
-	d.mu.Unlock()
-	return
+	resolved := current.(*ipname)
+	resolved.IPs = append(resolved.IPs, addrs...)
+	dnm.NameToIPs.Set(question, resolved)
 }
