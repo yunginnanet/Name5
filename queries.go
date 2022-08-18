@@ -7,8 +7,19 @@ import (
 	"github.com/miekg/dns"
 	cmap "github.com/orcaman/concurrent-map"
 	"github.com/rs/zerolog/log"
+	rl "github.com/yunginnanet/Rate5"
 	"inet.af/netaddr"
 )
+
+var (
+	dnsResolver = "127.0.0.1:53"
+	dnsRater    *rl.Limiter
+	dnsTimeout  = 5 // Seconds
+)
+
+func init() {
+	dnsRater = rl.NewLimiter(5, 50)
+}
 
 // TODO: benchmarks
 // TODO: better ratelimiting logic

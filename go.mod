@@ -6,12 +6,14 @@ require (
 	github.com/miekg/dns v1.1.50
 	github.com/orcaman/concurrent-map v1.0.0
 	github.com/rs/zerolog v1.27.0
+	github.com/yunginnanet/Rate5 v1.1.0
 	inet.af/netaddr v0.0.0-20220811202034-502d2d690317
 )
 
 require (
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
+	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	go4.org/intern v0.0.0-20211027215823-ae77deb06f29 // indirect
 	go4.org/unsafe/assume-no-moving-gc v0.0.0-20220617031537-928513b29760 // indirect
 	golang.org/x/mod v0.4.2 // indirect

@@ -11,17 +11,16 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-type ipname struct {
+type IPName struct {
 	Name string
 	IPs  []string
 }
 
 // DNSMap is used for resolving and keeping track of DNS query results and their relationships
 type DNSMap struct {
-	IPToPTR      cmap.ConcurrentMap
-	NameToIPs    cmap.ConcurrentMap // map[string]*ipname
-	Working      *int64
-	CNAMETargets *int64
+	IPToPTR   cmap.ConcurrentMap
+	NameToIPs cmap.ConcurrentMap // map[string]*IPName
+	Working   *int64
 
 	born *time.Time
 	ctx  context.Context
@@ -33,12 +32,11 @@ func newPtr(i int64) *int64 {
 
 func (dnm *DNSMap) initCounters() {
 	dnm.Working = newPtr(0)
-	dnm.CNAMETargets = newPtr(0)
 }
 
 func (dnm *DNSMap) initMaps() {
 	dnm.IPToPTR = cmap.New()
-	dnm.NameToIPs = cmap.New() // make(map[string]*ipname)
+	dnm.NameToIPs = cmap.New() // make(map[string]*IPName)
 }
 
 // NewDNSMap creates a new DNSMap type
@@ -47,6 +45,7 @@ func NewDNSMap(name string) *DNSMap {
 	name = dns.Fqdn(name)
 	dnsmap := &DNSMap{ //   ipaddr[domain][ipaddr]boolean
 		born: &tn,
+		ctx:  context.Background(),
 	}
 
 	dnsmap.initMaps()
@@ -70,15 +69,20 @@ func NewDNSMap(name string) *DNSMap {
 
 func (dnm *DNSMap) waitUntilDone() {
 	time.Sleep(1 * time.Second)
+	var count = 0
 	for {
 		select {
 		case <-dnm.ctx.Done():
 			return
 		default:
-			time.Sleep(5 * time.Second)
-			if atomic.LoadInt64(dnm.Working) == 0 &&
-				atomic.LoadInt64(dnm.CNAMETargets) == 0 {
-				return
+			time.Sleep(1250 * time.Millisecond)
+			if atomic.LoadInt64(dnm.Working) <= 0 {
+				count++
+				if count > 2 {
+					return
+				}
+			} else {
+				log.Trace().Msgf("Waiting for %d DNS queries to finish", atomic.LoadInt64(dnm.Working))
 			}
 		}
 	}
@@ -96,30 +100,27 @@ func (dnm *DNSMap) chipOff(delay int) {
 }
 
 func (dnm *DNSMap) process(in *dns.Msg) {
+	defer dnm.chipOff(100)
+
 	question := in.Question[0].Name
 	var addrs []string
 	for _, resource := range in.Answer {
-
-		log.Trace().Int64("working", atomic.LoadInt64(dnm.Working)).
-			Interface("resource", resource).Msg("working...")
-
+		/*log.Trace().Int64("working", atomic.LoadInt64(dnm.Working)).
+		Interface("resource", resource).Msg("working...")*/
 		switch record := resource.(type) {
 		case *dns.NULL:
 			log.Error().Caller().Msg(record.Data)
-			dnm.chipOff(500)
 			continue
 		case *dns.A:
 			a := record.A.String()
 			addrs = append(addrs, a)
 			atomic.AddInt64(dnm.Working, 1)
 			go dnm.process(QueryPTR(a))
-			dnm.chipOff(100)
 		case *dns.AAAA:
 			aaaa := record.AAAA.String()
 			addrs = append(addrs, aaaa)
 			atomic.AddInt64(dnm.Working, 1)
 			go dnm.process(QueryPTR(aaaa))
-			dnm.chipOff(100)
 		case *dns.PTR:
 			ptr := record.Ptr
 			ogIP, ok := arpaToIP.Get(in.Question[0].Name)
@@ -133,7 +134,6 @@ func (dnm *DNSMap) process(in *dns.Msg) {
 				go dnm.process(Query4(ptr))
 				go dnm.process(Query6(ptr))
 			}
-			dnm.chipOff(100)
 		case *dns.CNAME:
 			cname := record.Target
 			if !dnm.NameToIPs.Has(cname) {
@@ -141,20 +141,19 @@ func (dnm *DNSMap) process(in *dns.Msg) {
 				go dnm.process(Query4(cname))
 				go dnm.process(Query6(cname))
 			}
-			dnm.chipOff(100)
 		default:
 			log.Warn().Caller().Interface("resource", record).Msg("unhandled record")
 		}
 	}
-	if len(addrs) < 0 {
+	if len(addrs) < 0 || in.Question[0].Qtype == dns.TypePTR {
 		return
 	}
 	current, ok := dnm.NameToIPs.Get(question)
 	if !ok {
-		dnm.NameToIPs.Set(question, &ipname{Name: question, IPs: addrs})
+		dnm.NameToIPs.Set(question, &IPName{Name: question, IPs: addrs})
 		return
 	}
-	resolved := current.(*ipname)
+	resolved := current.(*IPName)
 	resolved.IPs = append(resolved.IPs, addrs...)
 	dnm.NameToIPs.Set(question, resolved)
 }
