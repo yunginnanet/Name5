@@ -20,7 +20,10 @@ type IPName struct {
 type DNSMap struct {
 	IPToPTR   cmap.ConcurrentMap
 	NameToIPs cmap.ConcurrentMap // map[string]*IPName
-	Working   *int64
+	// SeenIPs is a map of IP addresses that have been seen in the DNS query results
+	// in theory this will be merged into an out of scope key/value store when the DNSMap is destroyed
+	SeenIPs cmap.ConcurrentMap // map[string][]string
+	Working *int64
 
 	born *time.Time
 	ctx  context.Context
@@ -37,6 +40,7 @@ func (dnm *DNSMap) initCounters() {
 func (dnm *DNSMap) initMaps() {
 	dnm.IPToPTR = cmap.New()
 	dnm.NameToIPs = cmap.New() // make(map[string]*IPName)
+	dnm.SeenIPs = cmap.New()   // make(map[string][]string)
 }
 
 // NewDNSMap creates a new DNSMap type
@@ -148,6 +152,21 @@ func (dnm *DNSMap) process(in *dns.Msg) {
 	if len(addrs) < 0 || in.Question[0].Qtype == dns.TypePTR {
 		return
 	}
+	var unseenIPs []string
+	for _, addr := range addrs {
+		if !dnm.SeenIPs.Has(addr) {
+			unseenIPs = append(unseenIPs, addr)
+			dnm.SeenIPs.Set(addr, []string{question})
+			continue
+		}
+		oldList, ok := dnm.SeenIPs.Get(addr)
+		if !ok {
+			log.Panic().Msg("unexpected error")
+		}
+		newList := append(oldList.([]string), question)
+		dnm.SeenIPs.Set(addr, newList)
+	}
+	addrs = unseenIPs
 	current, ok := dnm.NameToIPs.Get(question)
 	if !ok {
 		dnm.NameToIPs.Set(question, &IPName{Name: question, IPs: addrs})
